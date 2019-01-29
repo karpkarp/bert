@@ -25,6 +25,8 @@ import modeling
 import optimization
 import tokenization
 import tensorflow as tf
+import xml.etree.ElementTree as ET
+
 
 flags = tf.flags
 
@@ -91,10 +93,10 @@ flags.DEFINE_float(
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 1000,
+flags.DEFINE_integer("save_checkpoints_steps", 1,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
+flags.DEFINE_integer("iterations_per_loop", 1,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
@@ -203,6 +205,20 @@ class DataProcessor(object):
         lines.append(line)
       return lines
 
+  @classmethod 
+  def _read_rqe_xml(cls, input_file):
+    data = []
+    tree = ET.parse(input_file)
+    root = tree.getroot()
+    for pair in root:
+        example = {}
+        example["label"] = (pair.attrib["value"] == 'true')
+        for child in pair:
+            if child.tag == "chq": example["first"] = child.text.strip("\n").lstrip(" ")
+            else: example["second"] = child.text.strip("\n").lstrip(" ")
+        data.append(example)
+    return data
+
 
 class XnliProcessor(DataProcessor):
   """Processor for the XNLI data set."""
@@ -288,6 +304,41 @@ class MnliProcessor(DataProcessor):
         label = "contradiction"
       else:
         label = tokenization.convert_to_unicode(line[-1])
+      examples.append(
+          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+    return examples
+
+
+class RqeProcessor(DataProcessor):
+  "Processor For the RQE data set."
+  def get_train_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_rqe_xml(os.path.join(data_dir, "train.xml")), "train")
+
+  def get_dev_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_rqe_xml(os.path.join(data_dir, "test.xml")),
+        "dev_matched")
+
+  # def get_test_examples(self, data_dir):
+  #   """See base class."""
+  #   return self._create_examples(
+  #       self._read_tsv(os.path.join(data_dir, "test.xml")), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return [0, 1]
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and dev sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      guid = "%s-%s" % (set_type, tokenization.convert_to_unicode(str(line)))
+      text_a = tokenization.convert_to_unicode(line["first"])
+      text_b = tokenization.convert_to_unicode(line["second"])
+      label = int(line["label"])
       examples.append(
           InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
     return examples
@@ -788,6 +839,7 @@ def main(_):
       "mnli": MnliProcessor,
       "mrpc": MrpcProcessor,
       "xnli": XnliProcessor,
+      "rqe": RqeProcessor
   }
 
   tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
