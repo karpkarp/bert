@@ -26,6 +26,8 @@ import optimization
 import tokenization
 import tensorflow as tf
 import xml.etree.ElementTree as ET
+import json
+from layers import *
 
 
 flags = tf.flags
@@ -85,7 +87,7 @@ flags.DEFINE_integer("predict_batch_size", 8, "Total batch size for predict.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 3.0,
+flags.DEFINE_float("num_train_epochs", 4.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
@@ -93,10 +95,10 @@ flags.DEFINE_float(
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 1,
+flags.DEFINE_integer("save_checkpoints_steps", 100,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1,
+flags.DEFINE_integer("iterations_per_loop", 100,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
@@ -219,6 +221,19 @@ class DataProcessor(object):
         data.append(example)
     return data
 
+  @classmethod 
+  def _read_mednli_jsonl(cls, input_file):
+    data = []
+    with open(input_file, "r") as opened_file:
+      for line in opened_file:
+          example = {}
+          json_line = json.loads(line)
+          example["label"] = json_line["gold_label"]
+          example["first"] = json_line["sentence1"]
+          example["second"] = json_line["sentence2"]
+          data.append(example)
+    return data
+
 
 class XnliProcessor(DataProcessor):
   """Processor for the XNLI data set."""
@@ -339,6 +354,41 @@ class RqeProcessor(DataProcessor):
       text_a = tokenization.convert_to_unicode(line["first"])
       text_b = tokenization.convert_to_unicode(line["second"])
       label = int(line["label"])
+      examples.append(
+          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+    return examples
+
+
+class MednliProcessor(DataProcessor):
+  "Processor For the MedNLI data set."
+  def get_train_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_mednli_jsonl(os.path.join(data_dir, "mli_train_v1.jsonl")), "train")
+
+  def get_dev_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_mednli_jsonl(os.path.join(data_dir, "mli_dev_v1.jsonl")),
+        "dev_matched")
+
+  def get_test_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_mednli_jsonl(os.path.join(data_dir, "mli_test_v1.jsonl")), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return ["entailment", "neutral", "contradiction"] 
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and dev sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      guid = "%s-%s" % (set_type, tokenization.convert_to_unicode(str(line)))
+      text_a = tokenization.convert_to_unicode(line["first"])
+      text_b = tokenization.convert_to_unicode(line["second"])
+      label = line["label"]
       examples.append(
           InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
     return examples
@@ -662,6 +712,9 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
 
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+
+    # loss = tf.reduce_mean(tf.nn.weighted_cross_entropy_with_logits(one_hot_labels, logits, 0.4))
+
     loss = tf.reduce_mean(per_example_loss)
 
     return (loss, per_example_loss, logits, probabilities)
@@ -724,7 +777,10 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
       train_op = optimization.create_optimizer(
           total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
-
+      predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+      accuracy = tf.metrics.accuracy(
+            labels=label_ids, predictions=predictions, weights=is_real_example)
+      tf.summary.scalar("Accuracy", accuracy[1])
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
@@ -736,10 +792,28 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
         accuracy = tf.metrics.accuracy(
             labels=label_ids, predictions=predictions, weights=is_real_example)
+        precision = tf.metrics.precision(labels=label_ids, predictions=predictions, weights=is_real_example)
+        recall = tf.metrics.recall(labels=label_ids, predictions=predictions, weights=is_real_example)
         loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
+        per_class_acc = tf.metrics.mean_per_class_accuracy(labels=label_ids, predictions=predictions, num_classes=2)
+        conf_matrix = tf.confusion_matrix(labels=label_ids, predictions=predictions, num_classes=3)
+        con_matrix_sum = tf.Variable(tf.zeros(shape=(3,3), dtype=tf.int32),
+                                    trainable=False,
+                                    name="confusion_matrix_result",
+                                    collections=[tf.GraphKeys.LOCAL_VARIABLES])
+        update_op = tf.assign_add(con_matrix_sum, conf_matrix)
+
+        eval_conf_matrix =  tf.convert_to_tensor(con_matrix_sum), update_op
+
+
+
         return {
             "eval_accuracy": accuracy,
+            "eval_precision": precision,
+            "eval_recall":recall,
             "eval_loss": loss,
+            "per_class_acc":per_class_acc,
+            "conf_matrix": eval_conf_matrix
         }
 
       eval_metrics = (metric_fn,
@@ -839,7 +913,8 @@ def main(_):
       "mnli": MnliProcessor,
       "mrpc": MrpcProcessor,
       "xnli": XnliProcessor,
-      "rqe": RqeProcessor
+      "rqe": RqeProcessor,
+      "mednli": MednliProcessor
   }
 
   tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
@@ -929,7 +1004,7 @@ def main(_):
         seq_length=FLAGS.max_seq_length,
         is_training=True,
         drop_remainder=True)
-    estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+    train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps)
 
   if FLAGS.do_eval:
     eval_examples = processor.get_dev_examples(FLAGS.data_dir)
@@ -968,14 +1043,16 @@ def main(_):
         is_training=False,
         drop_remainder=eval_drop_remainder)
 
-    result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
-
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.gfile.GFile(output_eval_file, "w") as writer:
-      tf.logging.info("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.logging.info("  %s = %s", key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
+    eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, start_delay_secs=1,
+    throttle_secs=1)
+    result, _ = tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+    print(result, _)
+    # output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
+    # with tf.gfile.GFile(output_eval_file, "w") as writer:
+    #   tf.logging.info("***** Eval results *****")
+    #   for key in sorted(result.keys()):
+    #     tf.logging.info("  %s = %s", key, str(result[key]))
+    #     writer.write("%s = %s\n" % (key, str(result[key])))
 
   if FLAGS.do_predict:
     predict_examples = processor.get_test_examples(FLAGS.data_dir)
